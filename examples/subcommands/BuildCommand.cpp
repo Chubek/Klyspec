@@ -6,14 +6,25 @@ class BuildCommand final : public klyspec::NativeSubcommand {
 public:
   std::string id() const override { return "native.build"; }
   std::string name() const override { return "build"; }
+
   int execute(const std::vector<std::string> &args) override {
-    std::cout << "build args=" << args.size() << "\n";
+    bool release = false;
+    std::string target = "default";
+    for (const auto &arg : args) {
+      if (arg == "--release") {
+        release = true;
+      } else if (arg.rfind("--target=", 0) == 0) {
+        target = arg.substr(9);
+      }
+    }
+
+    std::cout << "[build] target=" << target << " mode=" << (release ? "release" : "debug") << "\n";
     return 0;
   }
 };
 
 int main() {
-  klyspec::SubcommandRegistry reg;
-  reg.register_subcommand(std::make_shared<BuildCommand>());
-  return reg.dispatch("build", {"--release"});
+  klyspec::SubcommandRegistry registry;
+  registry.register_subcommand(std::make_shared<BuildCommand>());
+  return registry.dispatch("build", {"--release", "--target=linux-x86_64"});
 }

@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstddef>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -83,6 +84,7 @@ struct Diagnostic {
 struct KlytmkNode {
   std::string kind{};
   std::string name{};
+  std::string body{};
   std::unordered_map<std::string, std::string> attributes{};
   SourceSpan span{};
 };
@@ -206,21 +208,37 @@ public:
       }
 
       if (!end_of_options && token.size() > 2 && token.rfind("--", 0) == 0) {
-        const auto *arg = registry_.lookup_argument(command->name, token);
+        auto long_name = token;
+        std::optional<std::string> inline_value{};
+        const auto eq = token.find('=');
+        if (eq != std::string::npos) {
+          long_name = token.substr(0, eq);
+          inline_value = token.substr(eq + 1);
+        }
+
+        const auto *arg = registry_.lookup_argument(command->name, long_name);
         if (arg == nullptr) {
           result.ok = false;
-          result.diagnostics.push_back("unknown option: " + token);
+          result.diagnostics.push_back("unknown option: " + long_name);
           continue;
         }
         if (arg->value_policy == ValuePolicy::required) {
+          if (inline_value.has_value()) {
+            result.values[arg->id].push_back(*inline_value);
+            continue;
+          }
           if (i + 1 >= argv.size()) {
             result.ok = false;
-            result.diagnostics.push_back("missing value for option: " + token);
+            result.diagnostics.push_back("missing value for option: " + long_name);
             continue;
           }
           result.values[arg->id].push_back(argv[++i]);
         } else {
-          result.values[arg->id].push_back("true");
+          if (inline_value.has_value()) {
+            result.values[arg->id].push_back(*inline_value);
+          } else {
+            result.values[arg->id].push_back("true");
+          }
         }
         continue;
       }
@@ -263,6 +281,36 @@ public:
       if (!result.values.contains(arg.id) && arg.default_value.has_value()) {
         result.values[arg.id].push_back(*arg.default_value);
       }
+      if (arg.kind == ArgumentKind::flag && result.values.contains(arg.id) && result.values.at(arg.id).size() > 1) {
+        result.ok = false;
+        result.diagnostics.push_back("flag provided multiple times: " + arg.id);
+      }
+      if ((arg.kind == ArgumentKind::option || arg.kind == ArgumentKind::switch_) &&
+          arg.kind != ArgumentKind::repeatable && result.values.contains(arg.id) &&
+          result.values.at(arg.id).size() > 1) {
+        result.ok = false;
+        result.diagnostics.push_back("non-repeatable option provided multiple times: " + arg.id);
+      }
+    }
+
+    // Validate positional/variadic contracts declared in ArgumentSpec list.
+    std::vector<const ArgumentSpec *> positional_specs{};
+    positional_specs.reserve(command->arguments.size());
+    const ArgumentSpec *variadic = nullptr;
+    for (const auto &arg : command->arguments) {
+      if (arg.kind == ArgumentKind::positional) {
+        positional_specs.push_back(&arg);
+      } else if (arg.kind == ArgumentKind::variadic) {
+        variadic = &arg;
+      }
+    }
+    if (result.positionals.size() < positional_specs.size()) {
+      result.ok = false;
+      result.diagnostics.push_back("missing positional argument(s)");
+    }
+    if (variadic == nullptr && result.positionals.size() > positional_specs.size() && !positional_specs.empty()) {
+      result.ok = false;
+      result.diagnostics.push_back("unexpected extra positional argument(s)");
     }
 
     return result;
@@ -285,6 +333,48 @@ inline auto line_col(std::string_view source, std::size_t pos) -> std::pair<std:
     }
   }
   return {line, col};
+}
+
+inline auto consume_block(dsl::ParsecInput &in, std::string &content) -> bool {
+  if (in.eof() || in.peek() != '{') {
+    return false;
+  }
+  in.consume();
+  int depth = 1;
+  while (!in.eof() && depth > 0) {
+    const char c = in.consume();
+    if (c == '{') {
+      ++depth;
+    } else if (c == '}') {
+      --depth;
+    }
+    if (depth > 0) {
+      content.push_back(c);
+    }
+  }
+  return depth == 0;
+}
+
+inline auto parse_help_string(std::string_view block) -> std::optional<std::string> {
+  const auto key = block.find("help-string");
+  if (key == std::string_view::npos) {
+    return std::nullopt;
+  }
+  const auto open = block.find('{', key);
+  const auto close = block.find('}', open == std::string_view::npos ? key : open + 1);
+  if (open == std::string_view::npos || close == std::string_view::npos || close <= open) {
+    return std::nullopt;
+  }
+  std::string text(block.substr(open + 1, close - open - 1));
+  std::size_t begin = 0;
+  while (begin < text.size() && std::isspace(static_cast<unsigned char>(text[begin]))) {
+    ++begin;
+  }
+  std::size_t end = text.size();
+  while (end > begin && std::isspace(static_cast<unsigned char>(text[end - 1]))) {
+    --end;
+  }
+  return text.substr(begin, end - begin);
 }
 } // namespace detail
 
@@ -339,6 +429,13 @@ inline auto parse_klytmk(std::string_view source) -> KlytmkParseResult {
   dsl::ParsecInput in{owned_source, 0};
   KlytmkAst ast{};
   bool parse_failed = false;
+  std::string parse_error = "klytmk parse error";
+  std::size_t parse_error_pos = 0;
+  auto fail = [&](std::string msg, std::size_t pos) {
+    parse_failed = true;
+    parse_error = std::move(msg);
+    parse_error_pos = pos;
+  };
   while (!in.eof()) {
     ws(in);
     if (in.eof()) {
@@ -347,27 +444,35 @@ inline auto parse_klytmk(std::string_view source) -> KlytmkParseResult {
     const auto begin = in.pos;
     auto kind = ident(in);
     if (!kind) {
+      fail("expected top-level identifier", in.pos);
       break;
     }
     if (*kind == "param" || *kind == "command") {
       auto name = quoted(in);
-      if (!name || !token('{')(in)) {
+      if (!name) {
+        fail("expected quoted node name", in.pos);
         break;
       }
-      int depth = 1;
-      while (!in.eof() && depth > 0) {
-        const char c = in.consume();
-        if (c == '{') ++depth;
-        if (c == '}') --depth;
+      ws(in);
+      std::string body;
+      if (!detail::consume_block(in, body)) {
+        fail("expected block body", in.pos);
+        break;
       }
-      if (depth != 0 || !token(';')(in)) {
-        parse_failed = true;
+      if (!token(';')(in)) {
+        fail("expected ';' after block", in.pos);
         break;
       }
       const auto [line, col] = detail::line_col(src_view, begin);
-      ast.nodes.push_back(KlytmkNode{.kind = *kind, .name = *name, .span = SourceSpan{begin, in.pos, line, col}});
+      std::unordered_map<std::string, std::string> attrs{};
+      if (auto help_text = detail::parse_help_string(body)) {
+        attrs["help-string"] = *help_text;
+      }
+      ast.nodes.push_back(KlytmkNode{
+          .kind = *kind, .name = *name, .body = std::move(body), .attributes = std::move(attrs), .span = SourceSpan{begin, in.pos, line, col}});
     } else if (*kind == "pre-evaluate") {
       if (!token('{')(in)) {
+        fail("expected '{' after pre-evaluate", in.pos);
         break;
       }
       std::unordered_map<std::string, std::string> attrs{};
@@ -379,22 +484,24 @@ inline auto parse_klytmk(std::string_view source) -> KlytmkParseResult {
         }
         auto key = ident(in);
         if (!key || !token('=')(in)) {
+          fail("expected key=value pair in pre-evaluate", in.pos);
           break;
         }
         auto value = quoted(in);
         if (!value || !token(';')(in)) {
+          fail("expected quoted value and ';' in pre-evaluate", in.pos);
           break;
         }
         attrs[*key] = *value;
       }
       if (!token(';')(in)) {
-        parse_failed = true;
+        fail("expected ';' after pre-evaluate block", in.pos);
         break;
       }
       const auto [line, col] = detail::line_col(src_view, begin);
       ast.nodes.push_back(KlytmkNode{.kind = *kind, .attributes = std::move(attrs), .span = SourceSpan{begin, in.pos, line, col}});
     } else {
-      parse_failed = true;
+      fail("unknown top-level directive: " + *kind, begin);
       break;
     }
   }
@@ -404,8 +511,9 @@ inline auto parse_klytmk(std::string_view source) -> KlytmkParseResult {
     result.ok = true;
     result.ast = std::move(ast);
   } else {
-    const auto [line, col] = detail::line_col(src_view, in.pos);
-    result.diagnostics.push_back(Diagnostic{.span = SourceSpan{in.pos, in.pos + 1, line, col}, .message = "klytmk parse error"});
+    const auto pos = parse_failed ? parse_error_pos : in.pos;
+    const auto [line, col] = detail::line_col(src_view, pos);
+    result.diagnostics.push_back(Diagnostic{.span = SourceSpan{pos, pos + 1, line, col}, .message = parse_error});
     result.ok = false;
   }
   return result;

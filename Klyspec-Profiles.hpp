@@ -3,6 +3,7 @@
 #include "SerdeTk/SerdeTk.hpp"
 
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -26,12 +27,25 @@ public:
     if (!doc.root.is_object()) return std::nullopt;
 
     std::unordered_map<std::string, std::string> out{};
-    for (const auto &entry : doc.root.as_object().fields) {
-      if (entry.second.is_string()) {
-        out[entry.first] = entry.second.as_string();
-      } else if (entry.second.is_int()) {
-        out[entry.first] = std::to_string(std::get<std::int64_t>(entry.second.data));
+    std::function<void(const std::string &, const serdetk::Value &)> flatten;
+    flatten = [&](const std::string &prefix, const serdetk::Value &node) {
+      if (node.is_string()) {
+        out[prefix] = node.as_string();
+      } else if (node.is_int()) {
+        out[prefix] = std::to_string(std::get<std::int64_t>(node.data));
+      } else if (node.is_double()) {
+        out[prefix] = std::to_string(std::get<double>(node.data));
+      } else if (node.is_bool()) {
+        out[prefix] = std::get<bool>(node.data) ? "true" : "false";
+      } else if (node.is_object()) {
+        for (const auto &entry : node.as_object().fields) {
+          const auto key = prefix.empty() ? entry.first : (prefix + "." + entry.first);
+          flatten(key, entry.second);
+        }
       }
+    };
+    for (const auto &entry : doc.root.as_object().fields) {
+      flatten(entry.first, entry.second);
     }
     return out;
   }

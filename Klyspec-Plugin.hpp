@@ -4,7 +4,9 @@
 
 #include <concepts>
 #include <memory>
+#include <optional>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -21,6 +23,7 @@ public:
   virtual void before_parse(std::vector<std::string> &) {}
   virtual void after_parse(ParseResult &) {}
   virtual void before_dispatch(const ParseResult &) {}
+  virtual std::optional<int> intercept_dispatch(const ParseResult &) { return std::nullopt; }
   virtual void after_dispatch(int) {}
 };
 
@@ -69,6 +72,11 @@ class PluginRegistry {
 public:
   bool register_plugin(std::shared_ptr<Plugin> plugin) {
     if (!plugin) return false;
+    const auto plugin_name = plugin->name();
+    if (plugin_name.empty() || names_.contains(plugin_name)) {
+      return false;
+    }
+    names_.insert(plugin_name);
     plugins_.push_back(std::move(plugin));
     return true;
   }
@@ -89,12 +97,22 @@ public:
     for (const auto &plugin : plugins_) plugin->before_dispatch(result);
   }
 
+  std::optional<int> intercept_dispatch(const ParseResult &result) {
+    for (const auto &plugin : plugins_) {
+      if (auto code = plugin->intercept_dispatch(result); code.has_value()) {
+        return code;
+      }
+    }
+    return std::nullopt;
+  }
+
   void after_dispatch(int code) {
     for (const auto &plugin : plugins_) plugin->after_dispatch(code);
   }
 
 private:
   std::vector<std::shared_ptr<Plugin>> plugins_{};
+  std::unordered_set<std::string> names_{};
 };
 
 } // namespace klyspec
